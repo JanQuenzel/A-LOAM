@@ -50,7 +50,11 @@
 #include <tf/transform_broadcaster.h>
 #include <eigen3/Eigen/Dense>
 #include <mutex>
-#include <queue>
+#include <deque>
+#include <fstream>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/subscriber.h>
 
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
@@ -60,7 +64,7 @@
 
 
 int corner_correspondence = 0, plane_correspondence = 0;
-
+constexpr size_t maxQueueSize = 5;
 constexpr double SCAN_PERIOD = 0.1;
 constexpr double DISTANCE_SQ_THRESHOLD = 25;
 constexpr double NEARBY_SCAN = 2.5;
@@ -100,11 +104,11 @@ double para_t[3] = {0, 0, 0};
 Eigen::Map<Eigen::Quaterniond> q_last_curr(para_q);
 Eigen::Map<Eigen::Vector3d> t_last_curr(para_t);
 
-std::queue<sensor_msgs::PointCloud2ConstPtr> cornerSharpBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> cornerLessSharpBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> surfFlatBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> cornerSharpBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> cornerLessSharpBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> surfFlatBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
 std::mutex mBuf;
 
 // undistort lidar point
@@ -150,28 +154,32 @@ void TransformToEnd(PointType const *const pi, PointType *const po)
 void laserCloudSharpHandler(const sensor_msgs::PointCloud2ConstPtr &cornerPointsSharp2)
 {
     mBuf.lock();
-    cornerSharpBuf.push(cornerPointsSharp2);
+    while ( cornerSharpBuf.size() > maxQueueSize ) cornerSharpBuf.pop_front(); 
+    cornerSharpBuf.push_back(cornerPointsSharp2);
     mBuf.unlock();
 }
 
 void laserCloudLessSharpHandler(const sensor_msgs::PointCloud2ConstPtr &cornerPointsLessSharp2)
 {
     mBuf.lock();
-    cornerLessSharpBuf.push(cornerPointsLessSharp2);
+    while ( cornerLessSharpBuf.size() > maxQueueSize ) cornerLessSharpBuf.pop_front();
+    cornerLessSharpBuf.push_back(cornerPointsLessSharp2);
     mBuf.unlock();
 }
 
 void laserCloudFlatHandler(const sensor_msgs::PointCloud2ConstPtr &surfPointsFlat2)
 {
     mBuf.lock();
-    surfFlatBuf.push(surfPointsFlat2);
+    while ( surfFlatBuf.size() > maxQueueSize ) surfFlatBuf.pop_front();
+    surfFlatBuf.push_back(surfPointsFlat2);
     mBuf.unlock();
 }
 
 void laserCloudLessFlatHandler(const sensor_msgs::PointCloud2ConstPtr &surfPointsLessFlat2)
 {
     mBuf.lock();
-    surfLessFlatBuf.push(surfPointsLessFlat2);
+    while ( surfLessFlatBuf.size() > maxQueueSize ) surfLessFlatBuf.pop_front();
+    surfLessFlatBuf.push_back(surfPointsLessFlat2);
     mBuf.unlock();
 }
 
@@ -179,9 +187,28 @@ void laserCloudLessFlatHandler(const sensor_msgs::PointCloud2ConstPtr &surfPoint
 void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudFullRes2)
 {
     mBuf.lock();
-    fullPointsBuf.push(laserCloudFullRes2);
+    while ( fullPointsBuf.size() > maxQueueSize ) fullPointsBuf.pop_front();
+    fullPointsBuf.push_back(laserCloudFullRes2);
     mBuf.unlock();
 }
+
+void allSyncCallback ( const sensor_msgs::PointCloud2ConstPtr & cornerPointsSharp2, const sensor_msgs::PointCloud2ConstPtr & cornerPointsLessSharp2, const sensor_msgs::PointCloud2ConstPtr & surfPointsFlat2, const sensor_msgs::PointCloud2ConstPtr & surfPointsLessFlat2, const sensor_msgs::PointCloud2ConstPtr & laserCloudFullRes2 )
+{
+    mBuf.lock();
+    while ( cornerSharpBuf.size() > maxQueueSize ) cornerSharpBuf.pop_front();
+    cornerSharpBuf.push_back(cornerPointsSharp2);
+    while ( cornerLessSharpBuf.size() > maxQueueSize ) cornerLessSharpBuf.pop_front();
+    cornerLessSharpBuf.push_back(cornerPointsLessSharp2);
+    while ( surfFlatBuf.size() > maxQueueSize ) surfFlatBuf.pop_front();
+    surfFlatBuf.push_back(surfPointsFlat2);
+    while ( surfLessFlatBuf.size() > maxQueueSize ) surfLessFlatBuf.pop_front();
+    surfLessFlatBuf.push_back(surfPointsLessFlat2);
+    while ( fullPointsBuf.size() > maxQueueSize ) fullPointsBuf.pop_front();
+    fullPointsBuf.push_back(laserCloudFullRes2);
+    mBuf.unlock();
+}
+
+
 
 int main(int argc, char **argv)
 {
@@ -192,25 +219,30 @@ int main(int argc, char **argv)
 
     printf("Mapping %d Hz \n", 10 / skipFrameNum);
 
-    ros::Subscriber subCornerPointsSharp = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_sharp", 100, laserCloudSharpHandler);
+    message_filters::Subscriber<sensor_msgs::PointCloud2> subCornerPointsSharp (nh,"/laser_cloud_sharp", 10);
+    message_filters::Subscriber<sensor_msgs::PointCloud2> subCornerPointsLessSharp (nh,"/laser_cloud_less_sharp", 10);
+    message_filters::Subscriber<sensor_msgs::PointCloud2> subSurfPointsFlat (nh,"/laser_cloud_flat", 10);
+    message_filters::Subscriber<sensor_msgs::PointCloud2> subSurfPointsLessFlat (nh,"/laser_cloud_less_flat", 10);
+    message_filters::Subscriber<sensor_msgs::PointCloud2> subLaserCloudFullRes (nh,"/velodyne_cloud_2", 10);
 
-    ros::Subscriber subCornerPointsLessSharp = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_sharp", 100, laserCloudLessSharpHandler);
+    //ros::Subscriber subCornerPointsLessSharp = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_sharp", 10, laserCloudLessSharpHandler);
+    //ros::Subscriber subSurfPointsFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_flat", 10, laserCloudFlatHandler);
+    //ros::Subscriber subSurfPointsLessFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_flat", 10, laserCloudLessFlatHandler);
+//    ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_2", 10, laserCloudFullResHandler);
 
-    ros::Subscriber subSurfPointsFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_flat", 100, laserCloudFlatHandler);
+    typedef message_filters::sync_policies::ExactTime<sensor_msgs::PointCloud2,sensor_msgs::PointCloud2,sensor_msgs::PointCloud2,sensor_msgs::PointCloud2,sensor_msgs::PointCloud2> MySyncPolicy;
+    message_filters::Synchronizer<MySyncPolicy> sync(MySyncPolicy(10),subCornerPointsSharp,subCornerPointsLessSharp,subSurfPointsFlat,subSurfPointsLessFlat,subLaserCloudFullRes);
+    sync.registerCallback(boost::bind(&allSyncCallback, _1, _2, _3, _4, _5));
 
-    ros::Subscriber subSurfPointsLessFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_flat", 100, laserCloudLessFlatHandler);
+    ros::Publisher pubLaserCloudCornerLast = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 10);
 
-    ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_2", 100, laserCloudFullResHandler);
+    ros::Publisher pubLaserCloudSurfLast = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 10);
 
-    ros::Publisher pubLaserCloudCornerLast = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100);
+    ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 10);
 
-    ros::Publisher pubLaserCloudSurfLast = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100);
+    ros::Publisher pubLaserOdometry = nh.advertise<nav_msgs::Odometry>("/laser_odom_to_init", 10);
 
-    ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100);
-
-    ros::Publisher pubLaserOdometry = nh.advertise<nav_msgs::Odometry>("/laser_odom_to_init", 100);
-
-    ros::Publisher pubLaserPath = nh.advertise<nav_msgs::Path>("/laser_odom_path", 100);
+    ros::Publisher pubLaserPath = nh.advertise<nav_msgs::Path>("/laser_odom_path", 10);
 
     nav_msgs::Path laserPath;
 
@@ -225,6 +257,7 @@ int main(int argc, char **argv)
             !surfFlatBuf.empty() && !surfLessFlatBuf.empty() &&
             !fullPointsBuf.empty())
         {
+            mBuf.lock();
             timeCornerPointsSharp = cornerSharpBuf.front()->header.stamp.toSec();
             timeCornerPointsLessSharp = cornerLessSharpBuf.front()->header.stamp.toSec();
             timeSurfPointsFlat = surfFlatBuf.front()->header.stamp.toSec();
@@ -237,29 +270,29 @@ int main(int argc, char **argv)
                 timeSurfPointsLessFlat != timeLaserCloudFullRes)
             {
                 printf("unsync messeage!");
+//                mBuf.unlock(); //?
                 ROS_BREAK();
             }
 
-            mBuf.lock();
             cornerPointsSharp->clear();
             pcl::fromROSMsg(*cornerSharpBuf.front(), *cornerPointsSharp);
-            cornerSharpBuf.pop();
+            cornerSharpBuf.pop_front();
 
             cornerPointsLessSharp->clear();
             pcl::fromROSMsg(*cornerLessSharpBuf.front(), *cornerPointsLessSharp);
-            cornerLessSharpBuf.pop();
+            cornerLessSharpBuf.pop_front();
 
             surfPointsFlat->clear();
             pcl::fromROSMsg(*surfFlatBuf.front(), *surfPointsFlat);
-            surfFlatBuf.pop();
+            surfFlatBuf.pop_front();
 
             surfPointsLessFlat->clear();
             pcl::fromROSMsg(*surfLessFlatBuf.front(), *surfPointsLessFlat);
-            surfLessFlatBuf.pop();
+            surfLessFlatBuf.pop_front();
 
             laserCloudFullRes->clear();
             pcl::fromROSMsg(*fullPointsBuf.front(), *laserCloudFullRes);
-            fullPointsBuf.pop();
+            fullPointsBuf.pop_front();
             mBuf.unlock();
 
             TicToc t_whole;
@@ -520,6 +553,17 @@ int main(int argc, char **argv)
             laserOdometry.pose.pose.position.y = t_w_curr.y();
             laserOdometry.pose.pose.position.z = t_w_curr.z();
             pubLaserOdometry.publish(laserOdometry);
+
+            {
+                // write to file:
+                static std::ofstream posesFile ("./aloam_odom_poses.txt");
+                if( posesFile.is_open() )
+                {
+                     posesFile << laserOdometry.header.stamp.toNSec() << " " << t_w_curr.x() << " " << t_w_curr.y() << " " << t_w_curr.z()
+                               << " " << q_w_curr.x() << " " << q_w_curr.y() << " " << q_w_curr.z() << " " << q_w_curr.w() <<"\n";
+                }
+                else printf("AAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+            }
 
             geometry_msgs::PoseStamped laserPose;
             laserPose.header = laserOdometry.header;

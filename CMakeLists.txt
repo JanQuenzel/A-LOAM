@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
   cv_bridge
   tf
+  message_filters
 )
 
 #find_package(Eigen3 REQUIRED)

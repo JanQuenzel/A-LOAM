@@ -131,17 +131,29 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudMsg)
 
     pcl::PointCloud<pcl::PointXYZ> laserCloudIn;
     pcl::fromROSMsg(*laserCloudMsg, laserCloudIn);
-    std::vector<int> indices;
+    //std::vector<int> indices;
 
-    pcl::removeNaNFromPointCloud(laserCloudIn, laserCloudIn, indices);
-    removeClosedPointCloud(laserCloudIn, laserCloudIn, MINIMUM_RANGE);
+    //pcl::removeNaNFromPointCloud(laserCloudIn, laserCloudIn, indices);
+    //removeClosedPointCloud(laserCloudIn, laserCloudIn, MINIMUM_RANGE);
+
+    float startOri = 0, endOri = 0;
+    for ( int i = 0; i < laserCloudIn.points.size(); ++i )
+        if ( laserCloudIn.points[i].getVector3fMap().allFinite() )
+        {
+            startOri = -atan2(laserCloudIn.points[i].y, laserCloudIn.points[i].x);
+            break;
+        }
+    for ( int i = laserCloudIn.points.size()-1; i >= 0; --i )
+        if ( laserCloudIn.points[i].getVector3fMap().allFinite() )
+        {
+            endOri = -atan2(laserCloudIn.points[i].y, laserCloudIn.points[i].x) + 2*M_PI;
+            break;
+        }
 
 
     int cloudSize = laserCloudIn.points.size();
-    float startOri = -atan2(laserCloudIn.points[0].y, laserCloudIn.points[0].x);
-    float endOri = -atan2(laserCloudIn.points[cloudSize - 1].y,
-                          laserCloudIn.points[cloudSize - 1].x) +
-                   2 * M_PI;
+    //float startOri = -atan2(laserCloudIn.points[0].y, laserCloudIn.points[0].x);
+    //float endOri = -atan2(laserCloudIn.points[cloudSize - 1].y, laserCloudIn.points[cloudSize - 1].x) + 2 * M_PI;
 
     if (endOri - startOri > 3 * M_PI)
     {
@@ -159,6 +171,9 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudMsg)
     std::vector<pcl::PointCloud<PointType>> laserCloudScans(N_SCANS);
     for (int i = 0; i < cloudSize; i++)
     {
+        if ( !laserCloudIn.points[i].getVector3fMap().allFinite() ) { --count; continue;}
+        if ( laserCloudIn.points[i].getVector3fMap().squaredNorm() < MINIMUM_RANGE*MINIMUM_RANGE ) { --count; continue; }
+
         point.x = laserCloudIn.points[i].x;
         point.y = laserCloudIn.points[i].y;
         point.z = laserCloudIn.points[i].z;
@@ -177,26 +192,44 @@ void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudMsg)
         }
         else if (N_SCANS == 32)
         {
-            scanID = int((angle + 92.0/3.0) * 3.0 / 4.0);
-            if (scanID > (N_SCANS - 1) || scanID < 0)
+            if ( laserCloudIn.height > 1 )
             {
-                count--;
-                continue;
+                scanID = i % laserCloudIn.height;
+            }
+            else
+            {
+                scanID = int((angle + 92.0/3.0) * 3.0 / 4.0);
+                if (scanID > (N_SCANS - 1) || scanID < 0)
+                {
+                    count--;
+                    continue;
+                }
             }
         }
         else if (N_SCANS == 64)
-        {   
-            if (angle >= -8.83)
-                scanID = int((2 - angle) * 3.0 + 0.5);
-            else
-                scanID = N_SCANS / 2 + int((-8.83 - angle) * 2.0 + 0.5);
-
-            // use [0 50]  > 50 remove outlies 
-            if (angle > 2 || angle < -24.33 || scanID > 50 || scanID < 0)
+        {
+            if ( laserCloudIn.height > 1 )
             {
-                count--;
-                continue;
+                scanID = i % laserCloudIn.height;
             }
+            else
+            {
+                if (angle >= -8.83)
+                    scanID = int((2 - angle) * 3.0 + 0.5);
+                else
+                    scanID = N_SCANS / 2 + int((-8.83 - angle) * 2.0 + 0.5);
+
+                // use [0 50]  > 50 remove outlies 
+                if (angle > 2 || angle < -24.33 || scanID > 50 || scanID < 0)
+                {
+                    count--;
+                    continue;
+                }
+            }
+        }
+        else if ( N_SCANS == 128 )
+        {
+            scanID = i % laserCloudIn.height;
         }
         else
         {
@@ -469,31 +502,34 @@ int main(int argc, char **argv)
 
     printf("scan line number %d \n", N_SCANS);
 
-    if(N_SCANS != 16 && N_SCANS != 32 && N_SCANS != 64)
+    if(N_SCANS != 16 && N_SCANS != 32 && N_SCANS != 64 && N_SCANS != 128)
     {
-        printf("only support velodyne with 16, 32 or 64 scan line!");
+        printf("only support velodyne with 16, 32 or 64 or 128 scan line!");
         return 0;
     }
 
-    ros::Subscriber subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_points", 100, laserCloudHandler);
+    std::string scan_topic = "/velodyne_points";
+    nh.getParam("/scan_topic", scan_topic);
 
-    pubLaserCloud = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_2", 100);
+    ros::Subscriber subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>(scan_topic, 10, laserCloudHandler);
 
-    pubCornerPointsSharp = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_sharp", 100);
+    pubLaserCloud = nh.advertise<sensor_msgs::PointCloud2>("/velodyne_cloud_2", 10);
 
-    pubCornerPointsLessSharp = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_less_sharp", 100);
+    pubCornerPointsSharp = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_sharp", 10);
 
-    pubSurfPointsFlat = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_flat", 100);
+    pubCornerPointsLessSharp = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_less_sharp", 10);
 
-    pubSurfPointsLessFlat = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_less_flat", 100);
+    pubSurfPointsFlat = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_flat", 10);
 
-    pubRemovePoints = nh.advertise<sensor_msgs::PointCloud2>("/laser_remove_points", 100);
+    pubSurfPointsLessFlat = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_less_flat", 10);
+
+    pubRemovePoints = nh.advertise<sensor_msgs::PointCloud2>("/laser_remove_points", 10);
 
     if(PUB_EACH_LINE)
     {
         for(int i = 0; i < N_SCANS; i++)
         {
-            ros::Publisher tmp = nh.advertise<sensor_msgs::PointCloud2>("/laser_scanid_" + std::to_string(i), 100);
+            ros::Publisher tmp = nh.advertise<sensor_msgs::PointCloud2>("/laser_scanid_" + std::to_string(i), 10);
             pubEachScan.push_back(tmp);
         }
     }

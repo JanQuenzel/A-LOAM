@@ -53,10 +53,14 @@
 #include <eigen3/Eigen/Dense>
 #include <ceres/ceres.h>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <thread>
 #include <iostream>
 #include <string>
+
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/subscriber.h>
 
 #include "lidarFactor.hpp"
 #include "aloam_velodyne/common.h"
@@ -64,7 +68,7 @@
 
 
 int frameCount = 0;
-
+constexpr size_t maxQueueSize = 5;
 double timeLaserCloudCornerLast = 0;
 double timeLaserCloudSurfLast = 0;
 double timeLaserCloudFullRes = 0;
@@ -120,10 +124,10 @@ Eigen::Quaterniond q_wodom_curr(1, 0, 0, 0);
 Eigen::Vector3d t_wodom_curr(0, 0, 0);
 
 
-std::queue<sensor_msgs::PointCloud2ConstPtr> cornerLastBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> surfLastBuf;
-std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
-std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> cornerLastBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> surfLastBuf;
+std::deque<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
+std::deque<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::mutex mBuf;
 
 pcl::VoxelGrid<PointType> downSizeFilterCorner;
@@ -137,6 +141,7 @@ PointType pointOri, pointSel;
 ros::Publisher pubLaserCloudSurround, pubLaserCloudMap, pubLaserCloudFullRes, pubOdomAftMapped, pubOdomAftMappedHighFrec, pubLaserAfterMappedPath;
 
 nav_msgs::Path laserAfterMappedPath;
+
 
 // set initial guess
 void transformAssociateToMap()
@@ -175,29 +180,83 @@ void pointAssociateTobeMapped(PointType const *const pi, PointType *const po)
 void laserCloudCornerLastHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudCornerLast2)
 {
 	mBuf.lock();
-	cornerLastBuf.push(laserCloudCornerLast2);
+	cornerLastBuf.push_back(laserCloudCornerLast2);
 	mBuf.unlock();
 }
 
 void laserCloudSurfLastHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudSurfLast2)
 {
 	mBuf.lock();
-	surfLastBuf.push(laserCloudSurfLast2);
+	surfLastBuf.push_back(laserCloudSurfLast2);
 	mBuf.unlock();
 }
 
 void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &laserCloudFullRes2)
 {
 	mBuf.lock();
-	fullResBuf.push(laserCloudFullRes2);
+	fullResBuf.push_back(laserCloudFullRes2);
 	mBuf.unlock();
 }
+
+void allSyncCallback ( const sensor_msgs::PointCloud2ConstPtr & laserCloudCornerLast2, const sensor_msgs::PointCloud2ConstPtr & laserCloudSurfLast2, const nav_msgs::OdometryConstPtr & laserOdometry, const sensor_msgs::PointCloud2ConstPtr & laserCloudFullRes2 )
+{
+    mBuf.lock();
+    while ( cornerLastBuf.size() > maxQueueSize ) cornerLastBuf.pop_front();
+    cornerLastBuf.push_back(laserCloudCornerLast2);
+    while ( surfLastBuf.size() > maxQueueSize ) surfLastBuf.pop_front();
+    surfLastBuf.push_back(laserCloudCornerLast2);
+    while ( odometryBuf.size() > maxQueueSize ) odometryBuf.pop_front();
+    odometryBuf.push_back(laserOdometry);
+    while ( fullResBuf.size() > maxQueueSize ) fullResBuf.pop_front();
+    fullResBuf.push_back(laserCloudFullRes2);
+    mBuf.unlock();
+
+	// high frequence publish
+	Eigen::Quaterniond q_wodom_curr;
+	Eigen::Vector3d t_wodom_curr;
+	q_wodom_curr.x() = laserOdometry->pose.pose.orientation.x;
+	q_wodom_curr.y() = laserOdometry->pose.pose.orientation.y;
+	q_wodom_curr.z() = laserOdometry->pose.pose.orientation.z;
+	q_wodom_curr.w() = laserOdometry->pose.pose.orientation.w;
+	t_wodom_curr.x() = laserOdometry->pose.pose.position.x;
+	t_wodom_curr.y() = laserOdometry->pose.pose.position.y;
+	t_wodom_curr.z() = laserOdometry->pose.pose.position.z;
+
+	Eigen::Quaterniond q_w_curr = q_wmap_wodom * q_wodom_curr;
+	Eigen::Vector3d t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom; 
+
+	nav_msgs::Odometry odomAftMapped;
+	odomAftMapped.header.frame_id = "/camera_init";
+	odomAftMapped.child_frame_id = "/aft_mapped";
+	odomAftMapped.header.stamp = laserOdometry->header.stamp;
+	odomAftMapped.pose.pose.orientation.x = q_w_curr.x();
+	odomAftMapped.pose.pose.orientation.y = q_w_curr.y();
+	odomAftMapped.pose.pose.orientation.z = q_w_curr.z();
+	odomAftMapped.pose.pose.orientation.w = q_w_curr.w();
+	odomAftMapped.pose.pose.position.x = t_w_curr.x();
+	odomAftMapped.pose.pose.position.y = t_w_curr.y();
+	odomAftMapped.pose.pose.position.z = t_w_curr.z();
+	pubOdomAftMappedHighFrec.publish(odomAftMapped);
+
+
+            {
+		static std::ofstream posesFile ("./aloam_map_init_poses.txt");
+                // write to file:
+                if( posesFile.is_open() )
+                {
+                     posesFile << laserOdometry->header.stamp.toNSec() << " " << t_w_curr.x() << " " << t_w_curr.y() << " " << t_w_curr.z()
+                               << " " << q_w_curr.x() << " " << q_w_curr.y() << " " << q_w_curr.z() << " " << q_w_curr.w() <<"\n";
+                }
+                else printf("AAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+            }
+}
+
 
 //receive odomtry
 void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 {
 	mBuf.lock();
-	odometryBuf.push(laserOdometry);
+	odometryBuf.push_back(laserOdometry);
 	mBuf.unlock();
 
 	// high frequence publish
@@ -226,6 +285,18 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	odomAftMapped.pose.pose.position.y = t_w_curr.y();
 	odomAftMapped.pose.pose.position.z = t_w_curr.z();
 	pubOdomAftMappedHighFrec.publish(odomAftMapped);
+
+
+            {
+		static std::ofstream posesFile ("./aloam_map_init_poses.txt");
+                // write to file:
+                if( posesFile.is_open() )
+                {
+                     posesFile << laserOdometry->header.stamp.toNSec() << " " << t_w_curr.x() << " " << t_w_curr.y() << " " << t_w_curr.z()
+                               << " " << q_w_curr.x() << " " << q_w_curr.y() << " " << q_w_curr.z() << " " << q_w_curr.w() <<"\n";
+                }
+                else printf("AAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+            }
 }
 
 void process()
@@ -237,7 +308,7 @@ void process()
 		{
 			mBuf.lock();
 			while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
-				odometryBuf.pop();
+				odometryBuf.pop_front();
 			if (odometryBuf.empty())
 			{
 				mBuf.unlock();
@@ -245,7 +316,7 @@ void process()
 			}
 
 			while (!surfLastBuf.empty() && surfLastBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
-				surfLastBuf.pop();
+				surfLastBuf.pop_front();
 			if (surfLastBuf.empty())
 			{
 				mBuf.unlock();
@@ -253,7 +324,7 @@ void process()
 			}
 
 			while (!fullResBuf.empty() && fullResBuf.front()->header.stamp.toSec() < cornerLastBuf.front()->header.stamp.toSec())
-				fullResBuf.pop();
+				fullResBuf.pop_front();
 			if (fullResBuf.empty())
 			{
 				mBuf.unlock();
@@ -277,15 +348,15 @@ void process()
 
 			laserCloudCornerLast->clear();
 			pcl::fromROSMsg(*cornerLastBuf.front(), *laserCloudCornerLast);
-			cornerLastBuf.pop();
+			cornerLastBuf.pop_front();
 
 			laserCloudSurfLast->clear();
 			pcl::fromROSMsg(*surfLastBuf.front(), *laserCloudSurfLast);
-			surfLastBuf.pop();
+			surfLastBuf.pop_front();
 
 			laserCloudFullRes->clear();
 			pcl::fromROSMsg(*fullResBuf.front(), *laserCloudFullRes);
-			fullResBuf.pop();
+			fullResBuf.pop_front();
 
 			q_wodom_curr.x() = odometryBuf.front()->pose.pose.orientation.x;
 			q_wodom_curr.y() = odometryBuf.front()->pose.pose.orientation.y;
@@ -294,11 +365,11 @@ void process()
 			t_wodom_curr.x() = odometryBuf.front()->pose.pose.position.x;
 			t_wodom_curr.y() = odometryBuf.front()->pose.pose.position.y;
 			t_wodom_curr.z() = odometryBuf.front()->pose.pose.position.z;
-			odometryBuf.pop();
+			odometryBuf.pop_front();
 
 			while(!cornerLastBuf.empty())
 			{
-				cornerLastBuf.pop();
+				cornerLastBuf.pop_front();
 				printf("drop lidar frame in mapping for real time performance \n");
 			}
 
@@ -885,6 +956,17 @@ void process()
 			transform.setRotation(q);
 			br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "/camera_init", "/aft_mapped"));
 
+            {
+		static std::ofstream posesFile ("./aloam_map_opt_poses.txt");
+                // write to file:
+                if( posesFile.is_open() )
+                {
+                     posesFile << odomAftMapped.header.stamp.toNSec() << " " << t_w_curr.x() << " " << t_w_curr.y() << " " << t_w_curr.z()
+                               << " " << q_w_curr.x() << " " << q_w_curr.y() << " " << q_w_curr.z() << " " << q_w_curr.w() <<"\n";
+                }
+                else printf("AAAAAAAAAAAAAAAAAAAAAAAAAAA\n");
+            }
+
 			frameCount++;
 		}
 		std::chrono::milliseconds dura(2);
@@ -905,13 +987,19 @@ int main(int argc, char **argv)
 	downSizeFilterCorner.setLeafSize(lineRes, lineRes,lineRes);
 	downSizeFilterSurf.setLeafSize(planeRes, planeRes, planeRes);
 
-	ros::Subscriber subLaserCloudCornerLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
+        message_filters::Subscriber<sensor_msgs::PointCloud2> subLaserCloudCornerLast (nh,"/laser_cloud_corner_last", 10);
+        message_filters::Subscriber<sensor_msgs::PointCloud2> subLaserCloudSurfLast (nh,"/laser_cloud_surf_last", 10);
+        message_filters::Subscriber<nav_msgs::Odometry> subLaserOdometry (nh,"/laser_odom_to_init", 10);
+        message_filters::Subscriber<sensor_msgs::PointCloud2> subLaserCloudFullRes (nh,"/velodyne_cloud_3", 10);
 
-	ros::Subscriber subLaserCloudSurfLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
+        typedef message_filters::sync_policies::ExactTime<sensor_msgs::PointCloud2,sensor_msgs::PointCloud2,nav_msgs::Odometry,sensor_msgs::PointCloud2> MySyncPolicy;
+        message_filters::Synchronizer<MySyncPolicy> sync(MySyncPolicy(10),subLaserCloudCornerLast,subLaserCloudSurfLast,subLaserOdometry,subLaserCloudFullRes);
+        sync.registerCallback(boost::bind(&allSyncCallback, _1, _2, _3, _4));
 
-	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/laser_odom_to_init", 100, laserOdometryHandler);
-
-	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
+	//ros::Subscriber subLaserCloudCornerLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100, laserCloudCornerLastHandler);
+	//ros::Subscriber subLaserCloudSurfLast = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_surf_last", 100, laserCloudSurfLastHandler);
+	//ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/laser_odom_to_init", 100, laserOdometryHandler);
+	//ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_3", 100, laserCloudFullResHandler);
 
 	pubLaserCloudSurround = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_surround", 100);
 
